@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+// Interfaz mínima para interactuar con Uniswap V2 Router
+interface IUniswapV2Router02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function swapExactETHForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+    
+    function WETH() external pure returns (address);
+}
+
+/**
+ * @title KipuBankV3 - DeFi Aggregator Vault
+ * @notice Bóveda que acepta cualquier token de Uniswap V2, lo convierte a USDC y lo custodia.
+ * @dev Consolida balances en USDC eliminando riesgo de volatilidad de activos depositados.
+ */
+contract KipuBankV3 is AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /*//////////////////////////////////////////////////////////////
+                            ROLES Y CONSTANTES
+    //////////////////////////////////////////////////////////////*/
+    
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    
+    IUniswapV2Router02 public immutable uniswapRouter;
+    IERC20 public immutable usdcToken;
+    address public immutable wethToken; // Necesario para la ruta ETH -> USDC
+
+    /*//////////////////////////////////////////////////////////////
+                          VARIABLES DE ESTADO
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Límite máximo del banco en unidades de USDC (normalmente 6 decimales)
+    uint256 public bankCapUSDC;
+    
+    /// @notice Total de USDC custodiado actualmente
+    uint256 public totalDepositsUSDC;
+    
+    /// @notice Balance de usuarios (ahora solo rastreamos USDC)
+    mapping(address => uint256) private s_userBalancesUSDC;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTOS
+    //////////////////////////////////////////////////////////////*/
+
+    event DepositConverted(address indexed user, address indexed inputToken, uint256 inputAmount, uint256 usdcReceived);
+    event DepositDirect(address indexed user, uint256 amount);
+    event Withdrawal(address indexed user, uint256 amount);
+    event BankCapUpdated(uint256 newCap);
+
+    /*//////////////////////////////////////////////////////////////
+                                ERRORES
+    //////////////////////////////////////////////////////////////*/
+
+    error KipuBank__ZeroAmount();
+    error KipuBank__CapExceeded(uint256 attemptedTotal, uint256 cap);
+    error KipuBank__InsufficientBalance(uint256 requested, uint256 available);
+    error KipuBank__TransferFailed();
+    error KipuBank__SlippageExceeded(); // Protección vital en Swaps
+
+    /*//////////////////////////////////////////////////////////////
+                            CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(
+        uint256 _bankCapUSDC, 
+        address _router, 
+        address _usdc
+    ) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+
+        bankCapUSDC = _bankCapUSDC;
+        uniswapRouter = IUniswapV2Router02(_router);
+        usdcToken = IERC20(_usdc);
+        wethToken = IUniswapV2Router02(_router).WETH();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        LOGICA DE DEPÓSITO (SWAP)
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Deposita CUALQUIER token ERC20 soportado por Uniswap.
+     * @dev Realiza un swap automático a USDC y acredita el resultado.
+     * @param tokenInput Dirección del token que el usuario quiere depositar.
+     * @param amountIn Cantidad de tokens a depositar.
+     * @param minUsdcOut Protección contra slippage (mínimo USDC a recibir).
+     */
+    function depositTokenWithSwap(
+        address tokenInput, 
+        uint256 amountIn, 
+        uint256 minUsdcOut
+    ) external nonReentrant {
+        if (amountIn == 0) revert KipuBank__ZeroAmount();
+
+        // 1. Si el usuario deposita USDC directamente, saltamos el swap
+        if (tokenInput == address(usdcToken)) {
+            _depositDirect(amountIn);
+            return;
+        }
+
+        // 2. Transferir tokens del usuario al contrato
+        IERC20(tokenInput).safeTransferFrom(msg.sender, address(this), amountIn);
+
+        // 3. Aprobar al Router para gastar esos tokens
+        IERC20(tokenInput).safeIncreaseAllowance(address(uniswapRouter), amountIn);
+
+        // 4. Definir la ruta del Swap (Token -> USDC)
+        // Nota: En producción, para tokens oscuros, la ruta podría requerir saltos (Token->WETH->USDC)
+        address[] memory path = new address[](2);
+        path[0] = tokenInput;
+        path[1] = address(usdcToken);
+
+        // 5. Ejecutar Swap en Uniswap V2
+        // amounts[0] = input, amounts[1] = output (USDC)
+        uint256[] memory amounts = uniswapRouter.swapExactTokensForTokens(
+            amountIn,
+            minUsdcOut, // Slippage check
+            path,
+            address(this), // El contrato recibe los USDC
+            block.timestamp
+        );
+
+        uint256 usdcReceived = amounts[1];
+
+        // 6. Verificar Bank Cap y Actualizar Saldos
+        _finalizeDeposit(usdcReceived);
+
+        emit DepositConverted(msg.sender, tokenInput, amountIn, usdcReceived);
+    }
+
+    /**
+     * @notice Deposita ETH nativo.
+     * @dev Convierte ETH -> USDC automáticamente.
+     */
+    function depositETHWithSwap(uint256 minUsdcOut) external payable nonReentrant {
+        if (msg.value == 0) revert KipuBank__ZeroAmount();
+
+        // Ruta: WETH -> USDC
+        address[] memory path = new address[](2);
+        path[0] = wethToken;
+        path[1] = address(usdcToken);
+
+        // Ejecutar Swap (ETH nativo -> Tokens)
+        uint256[] memory amounts = uniswapRouter.swapExactETHForTokens{value: msg.value}(
+            minUsdcOut,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 usdcReceived = amounts[1];
+
+        _finalizeDeposit(usdcReceived);
+
+        emit DepositConverted(msg.sender, address(0), msg.value, usdcReceived);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        LOGICA INTERNA Y RETIROS
+    //////////////////////////////////////////////////////////////*/
+
+    function _depositDirect(uint256 amount) internal {
+        // Transferir USDC directo del usuario
+        usdcToken.safeTransferFrom(msg.sender, address(this), amount);
+        _finalizeDeposit(amount);
+        emit DepositDirect(msg.sender, amount);
+    }
+
+    function _finalizeDeposit(uint256 amountUSDC) internal {
+        // Checks
+        if (totalDepositsUSDC + amountUSDC > bankCapUSDC) {
+            revert KipuBank__CapExceeded(totalDepositsUSDC + amountUSDC, bankCapUSDC);
+        }
+
+        // Effects
+        s_userBalancesUSDC[msg.sender] += amountUSDC;
+        totalDepositsUSDC += amountUSDC;
+    }
+
+    /**
+     * @notice Permite retirar los fondos. 
+     * @dev Como todo se convirtió a USDC, el retiro es siempre en USDC.
+     */
+    function withdrawUSDC(uint256 amount) external nonReentrant {
+        if (amount == 0) revert KipuBank__ZeroAmount();
+        
+        uint256 balance = s_userBalancesUSDC[msg.sender];
+        if (amount > balance) revert KipuBank__InsufficientBalance(amount, balance);
+
+        // Effects
+        s_userBalancesUSDC[msg.sender] -= amount;
+        totalDepositsUSDC -= amount;
+
+        // Interactions
+        usdcToken.safeTransfer(msg.sender, amount);
+        
+        emit Withdrawal(msg.sender, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ADMINISTRACIÓN
+    //////////////////////////////////////////////////////////////*/
+
+    function setBankCapUSDC(uint256 _newCap) external onlyRole(ADMIN_ROLE) {
+        bankCapUSDC = _newCap;
+        emit BankCapUpdated(_newCap);
+    }
+
+    // Vista para que el frontend sepa cuánto tiene el usuario
+    function getUserBalanceUSDC(address user) external view returns (uint256) {
+        return s_userBalancesUSDC[user];
+    }
+}
