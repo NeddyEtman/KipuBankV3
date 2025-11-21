@@ -10,7 +10,7 @@
 
 ---
 
-## 🚀 Mejoras de Alto Nivel (V2 vs V3)
+##  Mejoras de Alto Nivel (V2 vs V3)
 
 La evolución de V2 a V3 representa un cambio de paradigma: de "Custodia Multiactivo" a "Gestión de Liquidez Automatizada".
 
@@ -23,7 +23,7 @@ La evolución de V2 a V3 representa un cambio de paradigma: de "Custodia Multiac
 
 ---
 
-## ⚙️ Arquitectura y Flujo de Datos
+## Arquitectura y Flujo de Datos
 
 1.  **Input:** Usuario envía ETH o Token X + `minUsdcOut` (protección slippage).
 2.  **Routing:** El contrato interactúa con el **Router de Uniswap V2**.
@@ -33,7 +33,7 @@ La evolución de V2 a V3 representa un cambio de paradigma: de "Custodia Multiac
 
 ---
 
-## 📦 Instrucciones de Despliegue
+## Instrucciones de Despliegue
 
 ### Prerrequisitos (Sepolia Testnet)
 Necesitas las direcciones de los contratos de infraestructura DeFi existentes en la red.
@@ -48,7 +48,7 @@ Necesitas las direcciones de los contratos de infraestructura DeFi existentes en
 
 ---
 
-## 💻 Guía de Interacción
+## Guía de Interacción
 
 ### 1. Depositar Tokens (ERC-20) - "Zap In"
 El usuario quiere depositar `LINK`, pero tener saldo en `USDC`.
@@ -68,7 +68,7 @@ Como todos los activos se convirtieron al entrar, el retiro es simple:
 
 ---
 
-## 🧠 Decisiones de Diseño y Trade-offs
+## Decisiones de Diseño y Trade-offs
 
 ### 1. Slippage y Protección MEV
 * **Decisión:** Requerir el parámetro `minUsdcOut` en los depósitos.
